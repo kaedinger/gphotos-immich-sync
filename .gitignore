@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+
+.env
+credentials.json
+token.json
+albums.json
+
+*.log
+.claude/settings.local.json
