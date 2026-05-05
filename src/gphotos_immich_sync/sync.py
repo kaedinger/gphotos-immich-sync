@@ -97,6 +97,22 @@ class CliPrompter(Prompter):
         choice = input("    [s]kip / [a]bort album? [s] ").strip().lower()
         return "abort" if choice == "a" else "skip"
 
+    def offer_offset_resolution(
+        self, offset_seconds: int, would_resolve: int, total_ambiguous: int
+    ) -> bool:
+        self.progress.clear()
+        sign = "+" if offset_seconds >= 0 else "-"
+        hours = abs(offset_seconds) // 3600
+        print(
+            f"  [time skew] {would_resolve} of {total_ambiguous} ambiguous photo(s) "
+            f"would auto-match if picker times are shifted by {sign}{hours}h "
+            f"(likely a timezone mismatch in this album)."
+        )
+        answer = input(
+            f"    Apply {sign}{hours}h shift to auto-match these? [y/N] "
+        ).strip().lower()
+        return answer == "y"
+
     def disambiguate(
         self,
         item: PickedItem,

@@ -7,6 +7,16 @@ from .immich import ImmichAsset, ImmichClient
 
 CONTEXT_DATE_PADDING = timedelta(days=7)
 
+# Candidate offsets (in seconds) considered when looking for an
+# album-wide time skew. ±1h covers the common case of one side storing
+# local time as UTC, including DST flips that push a whole import off by
+# an hour.
+ALBUM_OFFSET_CANDIDATES_S = (3600, -3600)
+
+# Don't bother offering the offset shortcut for tiny ambiguous sets — a
+# couple of incidental matches under a shift aren't a pattern.
+ALBUM_OFFSET_THRESHOLD = 5
+
 
 class AlbumAborted(Exception):
     """Raised by a prompter to abandon the current album mid-resolution."""
@@ -39,6 +49,12 @@ class Prompter(Protocol):
         candidates: list[ImmichAsset],
         narrowed_from: int,
     ) -> "ImmichAsset | None | str": ...
+    # offer_offset_resolution returns True to apply the offset to the
+    # ambiguous items in this album, False to fall through to per-item
+    # prompts.
+    def offer_offset_resolution(
+        self, offset_seconds: int, would_resolve: int, total_ambiguous: int
+    ) -> bool: ...
 
 
 class Matcher:
@@ -83,6 +99,28 @@ class Matcher:
             shown = narrowed if narrowed else cands
             shown = sorted(shown, key=lambda a: _candidate_distance(item, a))
             ambiguous.append((item, shown, len(cands)))
+
+        # Phase 2.5: a consistent ±1h skew between picker and Immich
+        # timestamps (typically a timezone mismatch on one side) leaves
+        # whole albums stuck on per-photo prompts. If many ambiguous
+        # items would resolve uniquely under the same shift, offer it
+        # once for this album.
+        if ambiguous:
+            detected = _detect_album_time_offset(ambiguous)
+            if detected is not None:
+                offset_seconds, resolutions = detected
+                if len(resolutions) >= ALBUM_OFFSET_THRESHOLD and self.prompter.offer_offset_resolution(
+                    offset_seconds, len(resolutions), len(ambiguous)
+                ):
+                    resolved_by_id = {id(item): asset for item, asset in resolutions}
+                    kept: list[tuple[PickedItem, list[ImmichAsset], int]] = []
+                    for item, shown, narrowed_from in ambiguous:
+                        asset = resolved_by_id.get(id(item))
+                        if asset is not None:
+                            auto_matched.append((item, asset))
+                        else:
+                            kept.append((item, shown, narrowed_from))
+                    ambiguous = kept
 
         if on_summary:
             on_summary(len(auto_matched), len(no_candidates), len(ambiguous))
@@ -189,6 +227,54 @@ def _narrow(
 
 def _parse_iso(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def _detect_album_time_offset(
+    ambiguous: list[tuple[PickedItem, list[ImmichAsset], int]],
+) -> tuple[int, list[tuple[PickedItem, ImmichAsset]]] | None:
+    """Find the ± shift that uniquely resolves the most ambiguous items.
+
+    For each candidate offset, count items where shifting the picker
+    timestamp by that offset hits exactly one candidate at second
+    precision. Return the dominant offset and its resolutions, or None
+    if no offset resolves anything.
+    """
+    by_offset: dict[int, list[tuple[PickedItem, ImmichAsset]]] = {
+        o: [] for o in ALBUM_OFFSET_CANDIDATES_S
+    }
+
+    for item, shown, _narrowed_from in ambiguous:
+        if not item.create_time:
+            continue
+        try:
+            picker_ts = _parse_iso(item.create_time).replace(microsecond=0)
+        except ValueError:
+            continue
+
+        for offset in ALBUM_OFFSET_CANDIDATES_S:
+            target = picker_ts + timedelta(seconds=offset)
+            unique: ImmichAsset | None = None
+            ambiguous_at_target = False
+            for a in shown:
+                if not a.file_created_at:
+                    continue
+                try:
+                    a_dt = _parse_iso(a.file_created_at).replace(microsecond=0)
+                except ValueError:
+                    continue
+                if a_dt == target:
+                    if unique is not None:
+                        ambiguous_at_target = True
+                        break
+                    unique = a
+            if unique is not None and not ambiguous_at_target:
+                by_offset[offset].append((item, unique))
+
+    best_offset = max(ALBUM_OFFSET_CANDIDATES_S, key=lambda o: len(by_offset[o]))
+    best = by_offset[best_offset]
+    if not best:
+        return None
+    return best_offset, best
 
 
 def _candidate_distance(
