@@ -23,6 +23,7 @@ class ImmichAsset:
 class ImmichAlbum:
     id: str
     name: str
+    asset_count: int = 0
 
 
 class ImmichClient:
@@ -61,9 +62,19 @@ class ImmichClient:
         r = self.session.get(f"{self.base_url}/api/albums")
         r.raise_for_status()
         return [
-            ImmichAlbum(id=a["id"], name=a.get("albumName", ""))
+            ImmichAlbum(
+                id=a["id"],
+                name=a.get("albumName", ""),
+                asset_count=int(a.get("assetCount") or 0),
+            )
             for a in r.json()
         ]
+
+    def get_album_asset_ids(self, album_id: str) -> set[str]:
+        r = self.session.get(f"{self.base_url}/api/albums/{album_id}")
+        r.raise_for_status()
+        data = r.json()
+        return {a["id"] for a in (data.get("assets") or []) if a.get("id")}
 
     def create_album(self, name: str, description: str = "") -> ImmichAlbum:
         body = {"albumName": name, "description": description}
