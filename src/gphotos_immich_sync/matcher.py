@@ -1,21 +1,20 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Iterable, Protocol
+from typing import Protocol
 
 from .google_picker import PickedItem
 from .immich import ImmichAsset, ImmichClient
 
-CONTEXT_DATE_PADDING = timedelta(days=7)
+# Offsets considered when comparing picker time to Immich time during the
+# strict auto-match check.
+#   0:     exact / minute-cut alignment
+#   ±3600: CET/CEST DST flip, or one side stored in local while the other
+#          is one hour off (common when EXIF is taken as UTC)
+#   ±7200: UTC stored as CEST or vice versa
+_AUTO_MATCH_OFFSETS_S = (0, 3600, -3600, 7200, -7200)
 
-# Candidate offsets (in seconds) considered when looking for an
-# album-wide time skew. ±1h covers the common case of one side storing
-# local time as UTC, including DST flips that push a whole import off by
-# an hour.
-ALBUM_OFFSET_CANDIDATES_S = (3600, -3600)
-
-# Don't bother offering the offset shortcut for tiny ambiguous sets — a
-# couple of incidental matches under a shift aren't a pattern.
-ALBUM_OFFSET_THRESHOLD = 5
+# Cap for the ambiguous display window.
+_AMBIGUOUS_TIME_WINDOW = timedelta(days=1)
 
 
 class AlbumAborted(Exception):
@@ -26,7 +25,7 @@ class AlbumAborted(Exception):
 class Resolution:
     item: PickedItem
     asset: ImmichAsset | None
-    status: str  # "matched" | "skipped" | "no_candidates" | "user_skipped"
+    status: str  # "matched" | "user_skipped"
 
 
 @dataclass
@@ -49,12 +48,6 @@ class Prompter(Protocol):
         candidates: list[ImmichAsset],
         narrowed_from: int,
     ) -> "ImmichAsset | None | str": ...
-    # offer_offset_resolution returns True to apply the offset to the
-    # ambiguous items in this album, False to fall through to per-item
-    # prompts.
-    def offer_offset_resolution(
-        self, offset_seconds: int, would_resolve: int, total_ambiguous: int
-    ) -> bool: ...
 
 
 class Matcher:
@@ -77,60 +70,38 @@ class Matcher:
         if progress:
             progress(len(items), len(items), None)
 
-        # Phase 2: classify each item without prompting yet. Narrowing
-        # happens here so the summary reflects post-narrowing counts.
-        ctx = _build_context([c[0] for _, c in prelim if len(c) == 1])
-
+        # Phase 2: classify each item.
         auto_matched: list[tuple[PickedItem, ImmichAsset]] = []
-        no_candidates: list[PickedItem] = []
+        no_match: list[PickedItem] = []
         ambiguous: list[tuple[PickedItem, list[ImmichAsset], int]] = []
 
         for item, cands in prelim:
-            if len(cands) == 1:
-                auto_matched.append((item, cands[0]))
-                continue
             if not cands:
-                no_candidates.append(item)
+                no_match.append(item)
                 continue
-            narrowed = _narrow(cands, ctx, item)
-            if len(narrowed) == 1:
-                auto_matched.append((item, narrowed[0]))
+
+            strict = _strict_match(item, cands)
+            if len(strict) == 1:
+                auto_matched.append((item, strict[0]))
                 continue
-            shown = narrowed if narrowed else cands
+
+            shown = _ambiguous_candidates(item, cands)
+            if not shown:
+                no_match.append(item)
+                continue
+
             shown = sorted(shown, key=lambda a: _candidate_distance(item, a))
             ambiguous.append((item, shown, len(cands)))
 
-        # Phase 2.5: a consistent ±1h skew between picker and Immich
-        # timestamps (typically a timezone mismatch on one side) leaves
-        # whole albums stuck on per-photo prompts. If many ambiguous
-        # items would resolve uniquely under the same shift, offer it
-        # once for this album.
-        if ambiguous:
-            detected = _detect_album_time_offset(ambiguous)
-            if detected is not None:
-                offset_seconds, resolutions = detected
-                if len(resolutions) >= ALBUM_OFFSET_THRESHOLD and self.prompter.offer_offset_resolution(
-                    offset_seconds, len(resolutions), len(ambiguous)
-                ):
-                    resolved_by_id = {id(item): asset for item, asset in resolutions}
-                    kept: list[tuple[PickedItem, list[ImmichAsset], int]] = []
-                    for item, shown, narrowed_from in ambiguous:
-                        asset = resolved_by_id.get(id(item))
-                        if asset is not None:
-                            auto_matched.append((item, asset))
-                        else:
-                            kept.append((item, shown, narrowed_from))
-                    ambiguous = kept
-
         if on_summary:
-            on_summary(len(auto_matched), len(no_candidates), len(ambiguous))
+            on_summary(len(auto_matched), len(no_match), len(ambiguous))
 
         # Phase 3: prompt for the unresolved.
         result = ResolutionResult()
         for item, asset in auto_matched:
             result.resolutions.append(Resolution(item, asset, "matched"))
 
-        for item in no_candidates:
+        for item in no_match:
             action = self.prompter.no_candidates(item)
             if action == "abort":
                 raise AlbumAborted()
@@ -148,133 +119,110 @@ class Matcher:
         return result
 
 
-def _build_context(assets: Iterable[ImmichAsset]) -> dict:
-    dates: list[datetime] = []
-    cameras: set[tuple[str, str]] = set()
-    for a in assets:
-        if a.file_created_at:
-            try:
-                dates.append(_parse_iso(a.file_created_at))
-            except ValueError:
-                pass
-        make = (a.camera_make or "").strip()
-        model = (a.camera_model or "").strip()
-        if make or model:
-            cameras.add((make, model))
-    return {
-        "min_date": min(dates) if dates else None,
-        "max_date": max(dates) if dates else None,
-        "cameras": cameras,
-    }
+def _camera_present(make: str | None, model: str | None) -> bool:
+    return bool((make or "").strip() or (model or "").strip())
 
 
-def _narrow(
-    cands: list[ImmichAsset], ctx: dict, item: PickedItem | None = None
-) -> list[ImmichAsset]:
-    out = list(cands)
+def _camera_match(item: PickedItem, asset: ImmichAsset) -> bool:
+    if not _camera_present(item.camera_make, item.camera_model):
+        return False
+    if not _camera_present(asset.camera_make, asset.camera_model):
+        return False
+    return (
+        (item.camera_make or "").strip() == (asset.camera_make or "").strip()
+        and (item.camera_model or "").strip() == (asset.camera_model or "").strip()
+    )
 
-    if ctx.get("min_date") and ctx.get("max_date"):
-        lo = ctx["min_date"] - CONTEXT_DATE_PADDING
-        hi = ctx["max_date"] + CONTEXT_DATE_PADDING
-        in_range: list[ImmichAsset] = []
-        for a in out:
-            if not a.file_created_at:
+
+def _pixel_match(item: PickedItem, asset: ImmichAsset) -> bool:
+    if not (item.width and item.height and asset.width and asset.height):
+        return False
+    return item.width == asset.width and item.height == asset.height
+
+
+def _time_match_strict(picker_dt: datetime, asset_dt: datetime) -> bool:
+    """True if asset matches picker under any allowed offset, with either
+    exact-second precision OR minute-cut alignment (one side has its
+    seconds zeroed)."""
+    a = asset_dt.replace(microsecond=0)
+    a_min = a.replace(second=0)
+    for offset in _AUTO_MATCH_OFFSETS_S:
+        p = (picker_dt + timedelta(seconds=offset)).replace(microsecond=0)
+        if p == a:
+            return True
+        if (p.second == 0 or a.second == 0) and p.replace(second=0) == a_min:
+            return True
+    return False
+
+
+def _strict_match(item: PickedItem, cands: list[ImmichAsset]) -> list[ImmichAsset]:
+    """Candidates qualifying for auto-match: camera + pixel + strict time.
+
+    When neither the picker item nor the candidate has any camera info
+    (e.g. old AVIs, screenshots), the camera requirement is vacuously
+    satisfied — pixel + strict-time + uniqueness still have to hold."""
+    if not item.create_time:
+        return []
+    try:
+        picker_dt = _parse_iso(item.create_time)
+    except ValueError:
+        return []
+    item_has_camera = _camera_present(item.camera_make, item.camera_model)
+    out: list[ImmichAsset] = []
+    for a in cands:
+        asset_has_camera = _camera_present(a.camera_make, a.camera_model)
+        if item_has_camera or asset_has_camera:
+            if not _camera_match(item, a):
                 continue
-            try:
-                dt = _parse_iso(a.file_created_at)
-            except ValueError:
-                continue
-            if lo <= dt <= hi:
-                in_range.append(a)
-        if in_range:
-            out = in_range
-
-    if ctx.get("cameras"):
-        cams = ctx["cameras"]
-        same_cam = [
-            a
-            for a in out
-            if ((a.camera_make or "").strip(), (a.camera_model or "").strip()) in cams
-        ]
-        if same_cam:
-            out = same_cam
-
-    # Per-item timestamp narrowing: prefer candidates whose Immich
-    # fileCreatedAt matches the picked item's createTime down to the
-    # second. Sub-second precision differs between Google and Immich (and
-    # rounds inconsistently), so we truncate to the second.
-    if item and item.create_time:
+        if not _pixel_match(item, a):
+            continue
+        if not a.file_created_at:
+            continue
         try:
-            target = _parse_iso(item.create_time).replace(microsecond=0)
+            asset_dt = _parse_iso(a.file_created_at)
         except ValueError:
-            target = None
-        if target is not None:
-            same_second: list[ImmichAsset] = []
-            for a in out:
-                if not a.file_created_at:
-                    continue
-                try:
-                    a_dt = _parse_iso(a.file_created_at).replace(microsecond=0)
-                except ValueError:
-                    continue
-                if a_dt == target:
-                    same_second.append(a)
-            if same_second:
-                out = same_second
+            continue
+        if _time_match_strict(picker_dt, asset_dt):
+            out.append(a)
+    return out
 
+
+def _ambiguous_candidates(
+    item: PickedItem, cands: list[ImmichAsset]
+) -> list[ImmichAsset]:
+    """Candidates to surface in the disambiguate prompt: camera matches
+    (when both sides have camera info) and within ±1 day of the picker
+    timestamp. The 1-day cap drops same-filename collisions from unrelated
+    dates; the camera filter is waived if either side lacks camera info
+    (e.g. screenshots, videos with stripped EXIF) so the prompt still has
+    something to show."""
+    item_has_camera = _camera_present(item.camera_make, item.camera_model)
+
+    picker_dt: datetime | None = None
+    if item.create_time:
+        try:
+            picker_dt = _parse_iso(item.create_time)
+        except ValueError:
+            pass
+
+    out: list[ImmichAsset] = []
+    for a in cands:
+        if item_has_camera and _camera_present(a.camera_make, a.camera_model):
+            if not _camera_match(item, a):
+                continue
+        if picker_dt is not None and a.file_created_at:
+            try:
+                asset_dt = _parse_iso(a.file_created_at)
+            except ValueError:
+                continue
+            if abs((asset_dt - picker_dt).total_seconds()) > _AMBIGUOUS_TIME_WINDOW.total_seconds():
+                continue
+        out.append(a)
     return out
 
 
 def _parse_iso(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
-
-
-def _detect_album_time_offset(
-    ambiguous: list[tuple[PickedItem, list[ImmichAsset], int]],
-) -> tuple[int, list[tuple[PickedItem, ImmichAsset]]] | None:
-    """Find the ± shift that uniquely resolves the most ambiguous items.
-
-    For each candidate offset, count items where shifting the picker
-    timestamp by that offset hits exactly one candidate at second
-    precision. Return the dominant offset and its resolutions, or None
-    if no offset resolves anything.
-    """
-    by_offset: dict[int, list[tuple[PickedItem, ImmichAsset]]] = {
-        o: [] for o in ALBUM_OFFSET_CANDIDATES_S
-    }
-
-    for item, shown, _narrowed_from in ambiguous:
-        if not item.create_time:
-            continue
-        try:
-            picker_ts = _parse_iso(item.create_time).replace(microsecond=0)
-        except ValueError:
-            continue
-
-        for offset in ALBUM_OFFSET_CANDIDATES_S:
-            target = picker_ts + timedelta(seconds=offset)
-            unique: ImmichAsset | None = None
-            ambiguous_at_target = False
-            for a in shown:
-                if not a.file_created_at:
-                    continue
-                try:
-                    a_dt = _parse_iso(a.file_created_at).replace(microsecond=0)
-                except ValueError:
-                    continue
-                if a_dt == target:
-                    if unique is not None:
-                        ambiguous_at_target = True
-                        break
-                    unique = a
-            if unique is not None and not ambiguous_at_target:
-                by_offset[offset].append((item, unique))
-
-    best_offset = max(ALBUM_OFFSET_CANDIDATES_S, key=lambda o: len(by_offset[o]))
-    best = by_offset[best_offset]
-    if not best:
-        return None
-    return best_offset, best
 
 
 def _candidate_distance(

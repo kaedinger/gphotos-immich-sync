@@ -22,12 +22,18 @@ class QuitRequested(Exception):
 
 def _copy_to_clipboard(text: str) -> bool:
     """Best-effort copy via PowerShell. Silent failure if unavailable."""
+    # PowerShell stdin defaults to the active Windows code page (cp1252
+    # on most German/English installs), which mangles UTF-8 — ä becomes
+    # Ã¤, em-dashes become â€”, etc. Force InputEncoding to UTF-8 so
+    # non-ASCII album names land on the clipboard intact.
+    ps = (
+        "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; "
+        "$input | Set-Clipboard"
+    )
     try:
         subprocess.run(
-            ["powershell", "-NoProfile", "-Command", "$input | Set-Clipboard"],
-            input=text,
-            text=True,
-            encoding="utf-8",
+            ["powershell", "-NoProfile", "-Command", ps],
+            input=text.encode("utf-8"),
             timeout=5,
             check=False,
             stdout=subprocess.DEVNULL,
@@ -94,24 +100,23 @@ class CliPrompter(Prompter):
     def no_candidates(self, item: PickedItem) -> str:
         self.progress.clear()
         print(f"  [no match] {item.filename}")
+        camera = (
+            f"{(item.camera_make or '').strip()} "
+            f"{(item.camera_model or '').strip()}"
+        ).strip()
+        parts = [
+            "    Picker:",
+            f"created={item.create_time or '?'}",
+            f"{item.width or '?'}x{item.height or '?'}",
+        ]
+        if camera:
+            parts.append(camera)
+        gphoto_url = _gphoto_date_url(item.create_time)
+        if gphoto_url:
+            parts.append(gphoto_url)
+        print("  ".join(parts))
         choice = input("    [s]kip / [a]bort album? [s] ").strip().lower()
         return "abort" if choice == "a" else "skip"
-
-    def offer_offset_resolution(
-        self, offset_seconds: int, would_resolve: int, total_ambiguous: int
-    ) -> bool:
-        self.progress.clear()
-        sign = "+" if offset_seconds >= 0 else "-"
-        hours = abs(offset_seconds) // 3600
-        print(
-            f"  [time skew] {would_resolve} of {total_ambiguous} ambiguous photo(s) "
-            f"would auto-match if picker times are shifted by {sign}{hours}h "
-            f"(likely a timezone mismatch in this album)."
-        )
-        answer = input(
-            f"    Apply {sign}{hours}h shift to auto-match these? [y/N] "
-        ).strip().lower()
-        return answer == "y"
 
     def disambiguate(
         self,
@@ -121,28 +126,59 @@ class CliPrompter(Prompter):
     ) -> "ImmichAsset | None | str":
         self.progress.clear()
         suffix = (
-            f" (narrowed from {narrowed_from} via album context)"
+            f" (narrowed from {narrowed_from} by camera/time filter)"
             if narrowed_from != len(candidates)
             else ""
         )
         print(f"\n  [ambiguous] {item.filename}{suffix}")
-        print(
-            f"    Picker: created={item.create_time or '?'}  "
-            f"{item.width or '?'}x{item.height or '?'}  "
-            f"{item.camera_make or ''} {item.camera_model or ''}".rstrip()
-        )
+
+        gphoto_url = _gphoto_date_url(item.create_time) or ""
+        picker_camera = (
+            f"{(item.camera_make or '').strip()} "
+            f"{(item.camera_model or '').strip()}"
+        ).strip()
+        # (label, created, pixels, size, camera, url)
+        rows: list[tuple[str, str, str, str, str, str]] = [(
+            "Picker:",
+            item.create_time or "?",
+            f"{item.width or '?'}x{item.height or '?'}",
+            "",
+            picker_camera,
+            gphoto_url,
+        )]
         for i, a in enumerate(candidates, 1):
-            tail = (
+            url = (
                 f"{self.immich_base_url}/photos/{a.id}"
                 if self.immich_base_url
                 else f"id:{a.id}"
             )
+            cam = (
+                f"{(a.camera_make or '').strip()} "
+                f"{(a.camera_model or '').strip()}"
+            ).strip()
+            rows.append((
+                f"[{i}]",
+                a.file_created_at or "?",
+                f"{a.width or '?'}x{a.height or '?'}",
+                _format_size(a.file_size),
+                cam,
+                url,
+            ))
+
+        label_w = max(len(r[0]) for r in rows)
+        created_w = max(len(r[1]) for r in rows)
+        pixels_w = max(len(r[2]) for r in rows)
+        size_w = max(len(r[3]) for r in rows)
+        camera_w = max(len(r[4]) for r in rows)
+
+        for label, created, pixels, size, cam, url in rows:
             print(
-                f"    [{i}] created={a.file_created_at or '?'}  "
-                f"{a.width or '?'}x{a.height or '?'}  "
-                f"{_format_size(a.file_size)}  "
-                f"{(a.camera_make or '')} {(a.camera_model or '')}".rstrip()
-                + f"  {tail}"
+                f"    {label:<{label_w}}  "
+                f"created={created:<{created_w}}  "
+                f"{pixels:<{pixels_w}}  "
+                f"{size:<{size_w}}  "
+                f"{cam:<{camera_w}}  "
+                f"{url}"
             )
         print("    [s] skip this photo  [a] abort album")
         while True:
@@ -278,6 +314,18 @@ def run() -> None:
                 print("\nQuit requested. Stopping after current album cleanup.")
 
     print("Done.")
+
+
+def _gphoto_date_url(create_time: str | None) -> str | None:
+    # Google Photos search refuses to honor literal filenames (tokenizes
+    # and drops middle parts), but a YYYY-MM-DD path jumps to that day's
+    # grid where the user can spot the photo by eye.
+    if not create_time or len(create_time) < 10:
+        return None
+    date = create_time[:10]
+    if date[4] != "-" or date[7] != "-":
+        return None
+    return f"https://photos.google.com/search/{date}"
 
 
 def _format_size(b: int | None) -> str:
