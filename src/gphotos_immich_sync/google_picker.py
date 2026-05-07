@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import requests
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -44,9 +45,24 @@ class GooglePickerClient:
         if self.token_path.exists():
             creds = Credentials.from_authorized_user_file(str(self.token_path), SCOPES)
         if not creds or not creds.valid:
+            refreshed = False
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
+                try:
+                    creds.refresh(Request())
+                    refreshed = True
+                except RefreshError:
+                    # Refresh token expired or revoked. Apps in OAuth
+                    # "Testing" publishing status get 7-day refresh tokens,
+                    # so this hits routinely. Drop the stale cache and
+                    # fall through to a fresh interactive flow.
+                    print(
+                        "  Cached Google token rejected (likely expired — "
+                        "Test-mode apps get 7-day refresh tokens). "
+                        "Re-authenticating…"
+                    )
+                    self.token_path.unlink(missing_ok=True)
+                    creds = None
+            if not refreshed:
                 flow = InstalledAppFlow.from_client_secrets_file(
                     str(self.credentials_path), SCOPES
                 )
