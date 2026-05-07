@@ -5,10 +5,11 @@ import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import state
 from .config import Config
 from .google_picker import GooglePickerClient, PickedItem
 from .immich import ImmichAlbum, ImmichAsset, ImmichClient
-from .matcher import AlbumAborted, Matcher, Prompter, Resolution
+from .matcher import AlbumAborted, Matcher, Prompter, ResolutionResult
 
 try:
     import msvcrt  # type: ignore
@@ -226,6 +227,9 @@ def run() -> None:
     for ia in immich.list_albums():
         existing_by_name.setdefault(ia.name.casefold(), ia)
 
+    state_path = cfg.google_token_path.parent / "album-state.json"
+    album_state = state.load(state_path)
+
     # Process everything in alphabetical order so resuming a partial run is
     # predictable.
     google_albums.sort(key=lambda a: a.name.casefold())
@@ -234,16 +238,23 @@ def run() -> None:
     #   to_process: albums that need work in the main pass — either missing
     #     from Immich (create), or present but with a count mismatch (resync
     #     to add photos that became available in Immich since last run).
+    #   reconciled: counts mismatch but a prior run confirmed the gap is
+    #     unrecoverable (partner-contributed photos the Picker can't return).
+    #     Skipped silently; gaps surface in the end-of-run manifest.
     #   counts_match: present in Immich with matching counts; skipped in the
     #     main pass but available for the optional id-check after.
     to_process: list[tuple[AlbumEntry, ImmichAlbum | None]] = []
+    reconciled: list[tuple[AlbumEntry, ImmichAlbum]] = []
     counts_match: list[tuple[AlbumEntry, ImmichAlbum]] = []
     for a in google_albums:
         ia = existing_by_name.get(a.name.casefold())
         if ia is None:
             to_process.append((a, None))
         elif a.count is None or a.count != ia.asset_count:
-            to_process.append((a, ia))
+            if state.is_reconciled(album_state, a.name, a.count, ia.asset_count):
+                reconciled.append((a, ia))
+            else:
+                to_process.append((a, ia))
         else:
             counts_match.append((a, ia))
 
@@ -254,6 +265,7 @@ def run() -> None:
         f"\nGoogle albums: {len(google_albums)}    "
         f"Missing: {create_n}    "
         f"Count mismatch: {resync_n}    "
+        f"Reconciled (gap): {len(reconciled)}    "
         f"Counts match: {len(counts_match)}\n"
     )
 
@@ -275,18 +287,25 @@ def run() -> None:
             for i, (a, ia) in enumerate(to_process, 1):
                 if ia is None:
                     print(f"[{i}/{len(to_process)}] {_album_label(a)}  (create)")
-                    _sync_album(google, immich, matcher, progress, a)
+                    _sync_album(
+                        google, immich, matcher, progress, a,
+                        album_state, state_path,
+                    )
                 else:
                     g = a.count if a.count is not None else "?"
                     print(
                         f"[{i}/{len(to_process)}] {_album_label(a)}  "
                         f"(resync; Google:{g}  Immich:{ia.asset_count})"
                     )
-                    _resync_album(google, immich, matcher, progress, a, ia)
+                    _resync_album(
+                        google, immich, matcher, progress, a, ia,
+                        album_state, state_path,
+                    )
                 print()
         except QuitRequested:
             progress.clear()
             print("\nQuit requested. Stopping after current album cleanup.")
+            _print_manual_download_manifest(album_state)
             print("Done.")
             return
     else:
@@ -307,13 +326,31 @@ def run() -> None:
                         f"[{i}/{len(counts_match)}] {_album_label(a)}  "
                         f"(id-check; Google:{a.count}  Immich:{ia.asset_count})"
                     )
-                    _resync_album(google, immich, matcher, progress, a, ia)
+                    _resync_album(
+                        google, immich, matcher, progress, a, ia,
+                        album_state, state_path,
+                    )
                     print()
             except QuitRequested:
                 progress.clear()
                 print("\nQuit requested. Stopping after current album cleanup.")
 
+    _print_manual_download_manifest(album_state)
     print("Done.")
+
+
+def _print_manual_download_manifest(album_state: dict) -> None:
+    gaps = state.gaps(album_state)
+    if not gaps:
+        return
+    print("\nReconciled albums with download gaps")
+    print("(partner-contributed photos the Picker API can't return — download")
+    print(" the full albums manually from Google Photos and import to Immich):")
+    name_w = max(len(n) for n, _, _ in gaps)
+    for name, g, i in gaps:
+        print(
+            f"  {name:<{name_w}}  Google:{g}  Immich:{i}  Missing:{g - i}"
+        )
 
 
 def _gphoto_date_url(create_time: str | None) -> str | None:
@@ -359,11 +396,12 @@ def _pick_and_match(
     progress: Progress,
     album_name: str,
     abort_message: str,
-) -> list[Resolution] | None:
+    known_member_ids: set[str] | None = None,
+) -> ResolutionResult | None:
     """Open picker, wait for picks, and resolve them against Immich.
 
-    Returns the matched resolutions (possibly empty) on success, or None if
-    the user skipped (Ctrl+C), aborted (AlbumAborted), or picked nothing.
+    Returns the full ResolutionResult on success, or None if the user
+    skipped (Ctrl+C), aborted (AlbumAborted), or picked nothing.
     Manages the picker session lifecycle.
     """
     session = google.create_session()
@@ -429,7 +467,7 @@ def _pick_and_match(
         if len(skipped) > 10:
             print(f"    … and {len(skipped) - 10} more")
 
-        return matched
+        return result
     finally:
         google.delete_session(session)
 
@@ -440,13 +478,16 @@ def _sync_album(
     matcher: Matcher,
     progress: Progress,
     album: AlbumEntry,
+    album_state: dict,
+    state_path: Path,
 ) -> None:
-    matched = _pick_and_match(
+    result = _pick_and_match(
         google, matcher, progress, album.name,
         abort_message="  Album aborted by user. Not creating album.",
     )
-    if matched is None:
+    if result is None:
         return
+    matched = result.matched
     if not matched:
         print("  No matches; not creating album.")
         return
@@ -454,6 +495,11 @@ def _sync_album(
     album_obj = immich.create_album(album.name)
     immich.add_assets(album_obj.id, [r.asset.id for r in matched if r.asset])
     print(f"  Created album '{album_obj.name}' with {len(matched)} asset(s).")
+
+    skipped_n = len(result.resolutions) - len(matched)
+    if skipped_n == 0:
+        state.mark_reconciled(album_state, album.name, album.count, len(matched))
+        state.save(state_path, album_state)
 
 
 def _resync_album(
@@ -463,16 +509,20 @@ def _resync_album(
     progress: Progress,
     album: AlbumEntry,
     existing: ImmichAlbum,
+    album_state: dict,
+    state_path: Path,
 ) -> None:
     existing_ids = immich.get_album_asset_ids(existing.id)
     print(f"  Immich album currently has {len(existing_ids)} asset(s).")
 
-    matched = _pick_and_match(
+    result = _pick_and_match(
         google, matcher, progress, album.name,
         abort_message="  Album aborted by user. Not modifying album.",
+        known_member_ids=existing_ids,
     )
-    if matched is None:
+    if result is None:
         return
+    matched = result.matched
     if not matched:
         print("  No matches; nothing to add.")
         return
@@ -483,12 +533,18 @@ def _resync_album(
         f"  Already in album: {already_present}    "
         f"To add: {len(to_add)}"
     )
-    if not to_add:
+    if to_add:
+        immich.add_assets(existing.id, [r.asset.id for r in to_add if r.asset])
+        print(f"  Added {len(to_add)} asset(s) to '{existing.name}'.")
+    else:
         print("  Album already contains all matched photos.")
-        return
 
-    immich.add_assets(existing.id, [r.asset.id for r in to_add if r.asset])
-    print(f"  Added {len(to_add)} asset(s) to '{existing.name}'.")
+    skipped_n = len(result.resolutions) - len(matched)
+    if to_add == [] and skipped_n == 0:
+        state.mark_reconciled(
+            album_state, album.name, album.count, len(existing_ids)
+        )
+        state.save(state_path, album_state)
 
 
 def _open_picker(picker_uri: str, album_name: str) -> None:

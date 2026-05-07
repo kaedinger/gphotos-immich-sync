@@ -60,6 +60,7 @@ class Matcher:
         items: list[PickedItem],
         progress=None,
         on_summary=None,
+        known_member_ids: set[str] | None = None,
     ) -> ResolutionResult:
         # Phase 1: search Immich for every item.
         prelim: list[tuple[PickedItem, list[ImmichAsset]]] = []
@@ -71,6 +72,7 @@ class Matcher:
             progress(len(items), len(items), None)
 
         # Phase 2: classify each item.
+        known = known_member_ids or set()
         auto_matched: list[tuple[PickedItem, ImmichAsset]] = []
         no_match: list[PickedItem] = []
         ambiguous: list[tuple[PickedItem, list[ImmichAsset], int]] = []
@@ -84,10 +86,27 @@ class Matcher:
             if len(strict) == 1:
                 auto_matched.append((item, strict[0]))
                 continue
+            # Tiebreaker for multi-strict: prior pick is in the album.
+            # If multiple candidates are already in the album (filename
+            # collisions within the same shared album are common), picking
+            # any of them is a no-op for the resync diff — pick the closest.
+            if len(strict) > 1:
+                in_album = [a for a in strict if a.id in known]
+                if in_album:
+                    pick = min(in_album, key=lambda a: _candidate_distance(item, a))
+                    auto_matched.append((item, pick))
+                    continue
 
             shown = _ambiguous_candidates(item, cands)
             if not shown:
                 no_match.append(item)
+                continue
+
+            # Same tiebreaker for ambiguous.
+            in_album = [a for a in shown if a.id in known]
+            if in_album:
+                pick = min(in_album, key=lambda a: _candidate_distance(item, a))
+                auto_matched.append((item, pick))
                 continue
 
             shown = sorted(shown, key=lambda a: _candidate_distance(item, a))
