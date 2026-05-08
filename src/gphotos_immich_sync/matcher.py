@@ -41,13 +41,20 @@ class Prompter(Protocol):
     # no_candidates returns "skip" or "abort".
     def no_candidates(self, item: PickedItem) -> str: ...
     # disambiguate returns the chosen asset, None to skip the photo,
-    # or the string "abort" to abort the whole album.
+    # "skip_rest" to skip all remaining ambiguous photos (album still
+    # gets created from what's already matched), or "abort" to abort
+    # the whole album.
     def disambiguate(
         self,
         item: PickedItem,
         candidates: list[ImmichAsset],
         narrowed_from: int,
+        index: int,
+        total: int,
     ) -> "ImmichAsset | None | str": ...
+    # confirm_rotation returns True if the user wants to allow swapped
+    # width/height as a strict-pixel match for the rest of this album.
+    def confirm_rotation(self, count: int) -> bool: ...
 
 
 class Matcher:
@@ -73,44 +80,59 @@ class Matcher:
 
         # Phase 2: classify each item.
         known = known_member_ids or set()
-        auto_matched: list[tuple[PickedItem, ImmichAsset]] = []
-        no_match: list[PickedItem] = []
-        ambiguous: list[tuple[PickedItem, list[ImmichAsset], int]] = []
 
-        for item, cands in prelim:
-            if not cands:
-                no_match.append(item)
-                continue
+        def classify(allow_rotation: bool):
+            auto_matched: list[tuple[PickedItem, ImmichAsset]] = []
+            no_match: list[PickedItem] = []
+            ambiguous: list[tuple[PickedItem, list[ImmichAsset], int]] = []
 
-            strict = _strict_match(item, cands)
-            if len(strict) == 1:
-                auto_matched.append((item, strict[0]))
-                continue
-            # Tiebreaker for multi-strict: prior pick is in the album.
-            # If multiple candidates are already in the album (filename
-            # collisions within the same shared album are common), picking
-            # any of them is a no-op for the resync diff — pick the closest.
-            if len(strict) > 1:
-                in_album = [a for a in strict if a.id in known]
+            for item, cands in prelim:
+                if not cands:
+                    no_match.append(item)
+                    continue
+
+                strict = _strict_match(item, cands, allow_rotation=allow_rotation)
+                if len(strict) == 1:
+                    auto_matched.append((item, strict[0]))
+                    continue
+                # Tiebreaker for multi-strict: prior pick is in the album.
+                # If multiple candidates are already in the album (filename
+                # collisions within the same shared album are common),
+                # picking any of them is a no-op for the resync diff —
+                # pick the closest.
+                if len(strict) > 1:
+                    in_album = [a for a in strict if a.id in known]
+                    if in_album:
+                        pick = min(in_album, key=lambda a: _candidate_distance(item, a))
+                        auto_matched.append((item, pick))
+                        continue
+
+                shown = _ambiguous_candidates(item, cands)
+                if not shown:
+                    no_match.append(item)
+                    continue
+
+                # Same tiebreaker for ambiguous.
+                in_album = [a for a in shown if a.id in known]
                 if in_album:
                     pick = min(in_album, key=lambda a: _candidate_distance(item, a))
                     auto_matched.append((item, pick))
                     continue
 
-            shown = _ambiguous_candidates(item, cands)
-            if not shown:
-                no_match.append(item)
-                continue
+                shown = sorted(shown, key=lambda a: _candidate_distance(item, a))
+                ambiguous.append((item, shown, len(cands)))
+            return auto_matched, no_match, ambiguous
 
-            # Same tiebreaker for ambiguous.
-            in_album = [a for a in shown if a.id in known]
-            if in_album:
-                pick = min(in_album, key=lambda a: _candidate_distance(item, a))
-                auto_matched.append((item, pick))
-                continue
+        auto_matched, no_match, ambiguous = classify(allow_rotation=False)
 
-            shown = sorted(shown, key=lambda a: _candidate_distance(item, a))
-            ambiguous.append((item, shown, len(cands)))
+        # Rotation pass: if allowing swapped width/height would auto-match
+        # additional items, ask the user once per album. Common when Immich
+        # stores rotated dimensions but the picker reports the sensor
+        # orientation (or vice versa).
+        rot_auto, rot_no, rot_amb = classify(allow_rotation=True)
+        rotation_gain = len(rot_auto) - len(auto_matched)
+        if rotation_gain > 0 and self.prompter.confirm_rotation(rotation_gain):
+            auto_matched, no_match, ambiguous = rot_auto, rot_no, rot_amb
 
         if on_summary:
             on_summary(len(auto_matched), len(no_match), len(ambiguous))
@@ -126,10 +148,21 @@ class Matcher:
                 raise AlbumAborted()
             result.resolutions.append(Resolution(item, None, "user_skipped"))
 
-        for item, shown, narrowed_from in ambiguous:
-            pick = self.prompter.disambiguate(item, shown, narrowed_from=narrowed_from)
+        skip_rest = False
+        for i, (item, shown, narrowed_from) in enumerate(ambiguous):
+            if skip_rest:
+                result.resolutions.append(Resolution(item, None, "user_skipped"))
+                continue
+            pick = self.prompter.disambiguate(
+                item, shown, narrowed_from=narrowed_from,
+                index=i + 1, total=len(ambiguous),
+            )
             if pick == "abort":
                 raise AlbumAborted()
+            if pick == "skip_rest":
+                result.resolutions.append(Resolution(item, None, "user_skipped"))
+                skip_rest = True
+                continue
             if pick is None:
                 result.resolutions.append(Resolution(item, None, "user_skipped"))
             else:
@@ -153,10 +186,16 @@ def _camera_match(item: PickedItem, asset: ImmichAsset) -> bool:
     )
 
 
-def _pixel_match(item: PickedItem, asset: ImmichAsset) -> bool:
+def _pixel_match(
+    item: PickedItem, asset: ImmichAsset, allow_rotation: bool = False
+) -> bool:
     if not (item.width and item.height and asset.width and asset.height):
         return False
-    return item.width == asset.width and item.height == asset.height
+    if item.width == asset.width and item.height == asset.height:
+        return True
+    if allow_rotation and item.width == asset.height and item.height == asset.width:
+        return True
+    return False
 
 
 def _time_match_strict(picker_dt: datetime, asset_dt: datetime) -> bool:
@@ -174,7 +213,11 @@ def _time_match_strict(picker_dt: datetime, asset_dt: datetime) -> bool:
     return False
 
 
-def _strict_match(item: PickedItem, cands: list[ImmichAsset]) -> list[ImmichAsset]:
+def _strict_match(
+    item: PickedItem,
+    cands: list[ImmichAsset],
+    allow_rotation: bool = False,
+) -> list[ImmichAsset]:
     """Candidates qualifying for auto-match: camera + pixel + strict time.
 
     When neither the picker item nor the candidate has any camera info
@@ -193,7 +236,7 @@ def _strict_match(item: PickedItem, cands: list[ImmichAsset]) -> list[ImmichAsse
         if item_has_camera or asset_has_camera:
             if not _camera_match(item, a):
                 continue
-        if not _pixel_match(item, a):
+        if not _pixel_match(item, a, allow_rotation=allow_rotation):
             continue
         if not a.file_created_at:
             continue

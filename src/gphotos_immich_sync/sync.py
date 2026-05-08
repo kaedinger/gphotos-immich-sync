@@ -124,6 +124,8 @@ class CliPrompter(Prompter):
         item: PickedItem,
         candidates: list[ImmichAsset],
         narrowed_from: int,
+        index: int,
+        total: int,
     ) -> "ImmichAsset | None | str":
         self.progress.clear()
         suffix = (
@@ -131,7 +133,7 @@ class CliPrompter(Prompter):
             if narrowed_from != len(candidates)
             else ""
         )
-        print(f"\n  [ambiguous] {item.filename}{suffix}")
+        print(f"\n  [ambiguous {index}/{total}] {item.filename}{suffix}")
 
         gphoto_url = _gphoto_date_url(item.create_time) or ""
         picker_camera = (
@@ -181,11 +183,16 @@ class CliPrompter(Prompter):
                 f"{cam:<{camera_w}}  "
                 f"{url}"
             )
-        print("    [s] skip this photo  [a] abort album")
+        print(
+            "    [s] skip this photo  [r] skip rest, create album  "
+            "[a] abort album"
+        )
         while True:
-            raw = input(f"    Pick [1-{len(candidates)}/s/a]: ").strip().lower()
+            raw = input(f"    Pick [1-{len(candidates)}/s/r/a]: ").strip().lower()
             if raw == "s":
                 return None
+            if raw == "r":
+                return "skip_rest"
             if raw == "a":
                 return "abort"
             if raw.isdigit():
@@ -193,6 +200,17 @@ class CliPrompter(Prompter):
                 if 1 <= idx <= len(candidates):
                     return candidates[idx - 1]
             print("    Invalid choice.")
+
+    def confirm_rotation(self, count: int) -> bool:
+        self.progress.clear()
+        print(
+            f"  {count} item(s) would auto-match if width/height can swap "
+            f"(rotation/orientation mismatch between picker and Immich)."
+        )
+        answer = input(
+            "  Allow rotation as a strict match for this album? [y/N] "
+        ).strip().lower()
+        return answer == "y"
 
 
 def run() -> None:
@@ -230,6 +248,21 @@ def run() -> None:
     state_path = cfg.google_token_path.parent / "album-state.json"
     album_state = state.load(state_path)
 
+    # Drop state entries for albums no longer in albums.json — they're
+    # otherwise unreachable (the partition loop only iterates current
+    # google_albums) and would prevent the user from rediscovering the
+    # album with a different count later.
+    google_names = {a.name.casefold() for a in google_albums}
+    stale = [k for k in list(album_state.keys()) if k not in google_names]
+    if stale:
+        for k in stale:
+            album_state.pop(k)
+        state.save(state_path, album_state)
+        print(
+            f"Discarded {len(stale)} stale album-state entr"
+            f"{'y' if len(stale) == 1 else 'ies'} no longer in albums.json."
+        )
+
     # Process everything in alphabetical order so resuming a partial run is
     # predictable.
     google_albums.sort(key=lambda a: a.name.casefold())
@@ -257,6 +290,13 @@ def run() -> None:
                 to_process.append((a, ia))
         else:
             counts_match.append((a, ia))
+
+    # Give the user a chance to pull albums off the manual-download list
+    # and back into the active queue (e.g. they want to do another picker
+    # visit, or they changed their mind about marking it).
+    reconciled = _offer_unreconcile(
+        reconciled, to_process, album_state, state_path
+    )
 
     create_n = sum(1 for _, ia in to_process if ia is None)
     resync_n = len(to_process) - create_n
@@ -496,10 +536,7 @@ def _sync_album(
     immich.add_assets(album_obj.id, [r.asset.id for r in matched if r.asset])
     print(f"  Created album '{album_obj.name}' with {len(matched)} asset(s).")
 
-    skipped_n = len(result.resolutions) - len(matched)
-    if skipped_n == 0:
-        state.mark_reconciled(album_state, album.name, album.count, len(matched))
-        state.save(state_path, album_state)
+    _reconcile_or_ask(album, len(matched), album_state, state_path)
 
 
 def _resync_album(
@@ -539,11 +576,91 @@ def _resync_album(
     else:
         print("  Album already contains all matched photos.")
 
-    skipped_n = len(result.resolutions) - len(matched)
-    if to_add == [] and skipped_n == 0:
-        state.mark_reconciled(
-            album_state, album.name, album.count, len(existing_ids)
-        )
+    final_count = len(existing_ids) + len(to_add)
+    _reconcile_or_ask(album, final_count, album_state, state_path)
+
+
+def _offer_unreconcile(
+    reconciled: list[tuple[AlbumEntry, ImmichAlbum]],
+    to_process: list[tuple[AlbumEntry, ImmichAlbum | None]],
+    album_state: dict,
+    state_path: Path,
+) -> list[tuple[AlbumEntry, ImmichAlbum]]:
+    """List currently-reconciled albums and let the user re-queue any of
+    them. Mutates ``to_process`` and ``album_state`` in place; returns the
+    new ``reconciled`` list (with re-queued entries removed)."""
+    if not reconciled:
+        return reconciled
+
+    print(f"\n{len(reconciled)} album(s) on manual-download list:")
+    for i, (a, ia) in enumerate(reconciled, 1):
+        g = a.count if a.count is not None else "?"
+        print(f"  [{i}] {a.name}  Google:{g}  Immich:{ia.asset_count}")
+    raw = input(
+        "Re-queue any for another picker visit? "
+        "Comma-separated indices, 'all', or Enter to skip: "
+    ).strip().lower()
+    if not raw:
+        return reconciled
+
+    selected: set[int] = set()
+    if raw == "all":
+        selected = set(range(1, len(reconciled) + 1))
+    else:
+        for token in raw.split(","):
+            token = token.strip()
+            if token.isdigit():
+                n = int(token)
+                if 1 <= n <= len(reconciled):
+                    selected.add(n)
+    if not selected:
+        return reconciled
+
+    kept: list[tuple[AlbumEntry, ImmichAlbum]] = []
+    for i, entry in enumerate(reconciled, 1):
+        a, ia = entry
+        if i in selected:
+            album_state.pop(a.name.casefold(), None)
+            to_process.append((a, ia))
+        else:
+            kept.append(entry)
+    state.save(state_path, album_state)
+    to_process.sort(key=lambda e: e[0].name.casefold())
+    print(f"  Re-queued {len(selected)} album(s).")
+    return kept
+
+
+def _reconcile_or_ask(
+    album: AlbumEntry,
+    immich_count: int,
+    album_state: dict,
+    state_path: Path,
+) -> None:
+    """Decide what to do about a count gap after a sync/resync pass.
+
+    No gap (or gap unknowable) → reconcile silently. Gap present → only the
+    user knows whether the missing photos are unrecoverable (Picker can't
+    return them — partner-contributed) or just deferred (Picker capped the
+    session, user wants to do another visit). Ask which."""
+    if album.count is None:
+        return
+
+    gap = album.count - immich_count
+    if gap <= 0:
+        state.mark_reconciled(album_state, album.name, album.count, immich_count)
+        state.save(state_path, album_state)
+        return
+
+    print(
+        f"  Gap: Immich has {immich_count} / Google has {album.count} "
+        f"({gap} missing)."
+    )
+    ans = input(
+        "  Mark for manual download and skip in future runs? "
+        "[y] yes  [N] no, retry next run: "
+    ).strip().lower()
+    if ans == "y":
+        state.mark_reconciled(album_state, album.name, album.count, immich_count)
         state.save(state_path, album_state)
 
 
