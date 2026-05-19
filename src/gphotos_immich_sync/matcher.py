@@ -51,6 +51,7 @@ class Prompter(Protocol):
         narrowed_from: int,
         index: int,
         total: int,
+        filename_only: bool = False,
     ) -> "ImmichAsset | None | str": ...
     # confirm_rotation returns True if the user wants to allow swapped
     # width/height as a strict-pixel match for the rest of this album.
@@ -84,7 +85,7 @@ class Matcher:
         def classify(allow_rotation: bool):
             auto_matched: list[tuple[PickedItem, ImmichAsset]] = []
             no_match: list[PickedItem] = []
-            ambiguous: list[tuple[PickedItem, list[ImmichAsset], int]] = []
+            ambiguous: list[tuple[PickedItem, list[ImmichAsset], int, bool]] = []
 
             for item, cands in prelim:
                 if not cands:
@@ -108,9 +109,15 @@ class Matcher:
                         continue
 
                 shown = _ambiguous_candidates(item, cands)
+                filename_only = False
                 if not shown:
-                    no_match.append(item)
-                    continue
+                    # Metadata filters dropped every filename match (commonly
+                    # because Google's createTime is way off from the Immich
+                    # asset's fileCreatedAt). Surface the raw filename matches
+                    # so the user can still confirm one rather than getting
+                    # an unactionable "no match".
+                    shown = list(cands)
+                    filename_only = True
 
                 # Same tiebreaker for ambiguous.
                 in_album = [a for a in shown if a.id in known]
@@ -120,7 +127,7 @@ class Matcher:
                     continue
 
                 shown = sorted(shown, key=lambda a: _candidate_distance(item, a))
-                ambiguous.append((item, shown, len(cands)))
+                ambiguous.append((item, shown, len(cands), filename_only))
             return auto_matched, no_match, ambiguous
 
         auto_matched, no_match, ambiguous = classify(allow_rotation=False)
@@ -149,13 +156,14 @@ class Matcher:
             result.resolutions.append(Resolution(item, None, "user_skipped"))
 
         skip_rest = False
-        for i, (item, shown, narrowed_from) in enumerate(ambiguous):
+        for i, (item, shown, narrowed_from, filename_only) in enumerate(ambiguous):
             if skip_rest:
                 result.resolutions.append(Resolution(item, None, "user_skipped"))
                 continue
             pick = self.prompter.disambiguate(
                 item, shown, narrowed_from=narrowed_from,
                 index=i + 1, total=len(ambiguous),
+                filename_only=filename_only,
             )
             if pick == "abort":
                 raise AlbumAborted()

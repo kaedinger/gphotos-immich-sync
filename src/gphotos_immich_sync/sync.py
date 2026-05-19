@@ -126,13 +126,15 @@ class CliPrompter(Prompter):
         narrowed_from: int,
         index: int,
         total: int,
+        filename_only: bool = False,
     ) -> "ImmichAsset | None | str":
         self.progress.clear()
-        suffix = (
-            f" (narrowed from {narrowed_from} by camera/time filter)"
-            if narrowed_from != len(candidates)
-            else ""
-        )
+        if filename_only:
+            suffix = " (filename-only; metadata didn't match any candidate)"
+        elif narrowed_from != len(candidates):
+            suffix = f" (narrowed from {narrowed_from} by camera/time filter)"
+        else:
+            suffix = ""
         print(f"\n  [ambiguous {index}/{total}] {item.filename}{suffix}")
 
         gphoto_url = _gphoto_date_url(item.create_time) or ""
