@@ -214,6 +214,18 @@ class CliPrompter(Prompter):
         ).strip().lower()
         return answer == "y"
 
+    def confirm_missing_picker_camera(self, count: int) -> bool:
+        self.progress.clear()
+        print(
+            f"  {count} item(s) would auto-match if missing picker camera "
+            f"info is treated as a vacuous match (Google dropped the camera "
+            f"fields; Immich still has them)."
+        )
+        answer = input(
+            "  Allow missing picker camera as a strict match for this album? [y/N] "
+        ).strip().lower()
+        return answer == "y"
+
 
 def run() -> None:
     try:

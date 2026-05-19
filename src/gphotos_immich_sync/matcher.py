@@ -56,6 +56,10 @@ class Prompter(Protocol):
     # confirm_rotation returns True if the user wants to allow swapped
     # width/height as a strict-pixel match for the rest of this album.
     def confirm_rotation(self, count: int) -> bool: ...
+    # confirm_missing_picker_camera returns True if the user wants to treat
+    # picker-side missing camera info as a vacuous camera match (i.e. trust
+    # the Immich asset's camera info alone) for the rest of this album.
+    def confirm_missing_picker_camera(self, count: int) -> bool: ...
 
 
 class Matcher:
@@ -82,7 +86,7 @@ class Matcher:
         # Phase 2: classify each item.
         known = known_member_ids or set()
 
-        def classify(allow_rotation: bool):
+        def classify(allow_rotation: bool, allow_missing_picker_camera: bool):
             auto_matched: list[tuple[PickedItem, ImmichAsset]] = []
             no_match: list[PickedItem] = []
             ambiguous: list[tuple[PickedItem, list[ImmichAsset], int, bool]] = []
@@ -92,7 +96,12 @@ class Matcher:
                     no_match.append(item)
                     continue
 
-                strict = _strict_match(item, cands, allow_rotation=allow_rotation)
+                strict = _strict_match(
+                    item,
+                    cands,
+                    allow_rotation=allow_rotation,
+                    allow_missing_picker_camera=allow_missing_picker_camera,
+                )
                 if len(strict) == 1:
                     auto_matched.append((item, strict[0]))
                     continue
@@ -130,13 +139,31 @@ class Matcher:
                 ambiguous.append((item, shown, len(cands), filename_only))
             return auto_matched, no_match, ambiguous
 
-        auto_matched, no_match, ambiguous = classify(allow_rotation=False)
+        auto_matched, no_match, ambiguous = classify(
+            allow_rotation=False, allow_missing_picker_camera=False,
+        )
+
+        # Camera-asymmetry pass: if Immich has camera info but the picker
+        # item doesn't (Google sometimes drops camera fields), strict-match
+        # would reject the asset even when timestamps and pixels line up.
+        # Offer once per album.
+        allow_missing_camera = False
+        cam_auto, cam_no, cam_amb = classify(
+            allow_rotation=False, allow_missing_picker_camera=True,
+        )
+        camera_gain = len(cam_auto) - len(auto_matched)
+        if camera_gain > 0 and self.prompter.confirm_missing_picker_camera(camera_gain):
+            auto_matched, no_match, ambiguous = cam_auto, cam_no, cam_amb
+            allow_missing_camera = True
 
         # Rotation pass: if allowing swapped width/height would auto-match
         # additional items, ask the user once per album. Common when Immich
         # stores rotated dimensions but the picker reports the sensor
         # orientation (or vice versa).
-        rot_auto, rot_no, rot_amb = classify(allow_rotation=True)
+        rot_auto, rot_no, rot_amb = classify(
+            allow_rotation=True,
+            allow_missing_picker_camera=allow_missing_camera,
+        )
         rotation_gain = len(rot_auto) - len(auto_matched)
         if rotation_gain > 0 and self.prompter.confirm_rotation(rotation_gain):
             auto_matched, no_match, ambiguous = rot_auto, rot_no, rot_amb
@@ -225,12 +252,17 @@ def _strict_match(
     item: PickedItem,
     cands: list[ImmichAsset],
     allow_rotation: bool = False,
+    allow_missing_picker_camera: bool = False,
 ) -> list[ImmichAsset]:
     """Candidates qualifying for auto-match: camera + pixel + strict time.
 
     When neither the picker item nor the candidate has any camera info
     (e.g. old AVIs, screenshots), the camera requirement is vacuously
-    satisfied — pixel + strict-time + uniqueness still have to hold."""
+    satisfied — pixel + strict-time + uniqueness still have to hold.
+
+    When ``allow_missing_picker_camera`` is True, picker items without
+    camera info also vacuously satisfy the camera check even if the asset
+    has camera info — used after a per-album confirm."""
     if not item.create_time:
         return []
     try:
@@ -241,9 +273,17 @@ def _strict_match(
     out: list[ImmichAsset] = []
     for a in cands:
         asset_has_camera = _camera_present(a.camera_make, a.camera_model)
-        if item_has_camera or asset_has_camera:
+        if item_has_camera and asset_has_camera:
             if not _camera_match(item, a):
                 continue
+        elif item_has_camera and not asset_has_camera:
+            # Picker reports a camera but Immich doesn't — likely a
+            # different file. Don't auto-match.
+            continue
+        elif not item_has_camera and asset_has_camera:
+            if not allow_missing_picker_camera:
+                continue
+        # else: neither has camera — vacuous match.
         if not _pixel_match(item, a, allow_rotation=allow_rotation):
             continue
         if not a.file_created_at:
