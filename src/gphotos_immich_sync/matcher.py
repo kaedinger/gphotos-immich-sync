@@ -16,6 +16,11 @@ _AUTO_MATCH_OFFSETS_S = (0, 3600, -3600, 7200, -7200)
 # Cap for the ambiguous display window.
 _AMBIGUOUS_TIME_WINDOW = timedelta(days=1)
 
+# Seconds of slack allowed in strict time matching when the user opts in
+# per-album. Covers AVI/container quirks where Google and Immich extract
+# stream timestamps that differ by 1–2 seconds.
+_TIME_DRIFT_TOLERANCE_S = 2
+
 
 class AlbumAborted(Exception):
     """Raised by a prompter to abandon the current album mid-resolution."""
@@ -60,6 +65,10 @@ class Prompter(Protocol):
     # picker-side missing camera info as a vacuous camera match (i.e. trust
     # the Immich asset's camera info alone) for the rest of this album.
     def confirm_missing_picker_camera(self, count: int) -> bool: ...
+    # confirm_time_drift returns True if the user wants to allow up to
+    # ``tolerance_s`` seconds of drift on top of the normal offset set
+    # for strict time matching in the rest of this album.
+    def confirm_time_drift(self, count: int, tolerance_s: int) -> bool: ...
 
 
 class Matcher:
@@ -86,7 +95,11 @@ class Matcher:
         # Phase 2: classify each item.
         known = known_member_ids or set()
 
-        def classify(allow_rotation: bool, allow_missing_picker_camera: bool):
+        def classify(
+            allow_rotation: bool,
+            allow_missing_picker_camera: bool,
+            time_drift_tolerance_s: int,
+        ):
             auto_matched: list[tuple[PickedItem, ImmichAsset]] = []
             no_match: list[PickedItem] = []
             ambiguous: list[tuple[PickedItem, list[ImmichAsset], int, bool]] = []
@@ -101,6 +114,7 @@ class Matcher:
                     cands,
                     allow_rotation=allow_rotation,
                     allow_missing_picker_camera=allow_missing_picker_camera,
+                    time_drift_tolerance_s=time_drift_tolerance_s,
                 )
                 if len(strict) == 1:
                     auto_matched.append((item, strict[0]))
@@ -140,7 +154,9 @@ class Matcher:
             return auto_matched, no_match, ambiguous
 
         auto_matched, no_match, ambiguous = classify(
-            allow_rotation=False, allow_missing_picker_camera=False,
+            allow_rotation=False,
+            allow_missing_picker_camera=False,
+            time_drift_tolerance_s=0,
         )
 
         # Camera-asymmetry pass: if Immich has camera info but the picker
@@ -149,12 +165,30 @@ class Matcher:
         # Offer once per album.
         allow_missing_camera = False
         cam_auto, cam_no, cam_amb = classify(
-            allow_rotation=False, allow_missing_picker_camera=True,
+            allow_rotation=False,
+            allow_missing_picker_camera=True,
+            time_drift_tolerance_s=0,
         )
         camera_gain = len(cam_auto) - len(auto_matched)
         if camera_gain > 0 and self.prompter.confirm_missing_picker_camera(camera_gain):
             auto_matched, no_match, ambiguous = cam_auto, cam_no, cam_amb
             allow_missing_camera = True
+
+        # Time-drift pass: AVI/container files often have a 1–2s mismatch
+        # between Google's createTime and Immich's fileCreatedAt. Offer to
+        # absorb that drift once per album.
+        drift_tolerance = 0
+        drift_auto, drift_no, drift_amb = classify(
+            allow_rotation=False,
+            allow_missing_picker_camera=allow_missing_camera,
+            time_drift_tolerance_s=_TIME_DRIFT_TOLERANCE_S,
+        )
+        drift_gain = len(drift_auto) - len(auto_matched)
+        if drift_gain > 0 and self.prompter.confirm_time_drift(
+            drift_gain, _TIME_DRIFT_TOLERANCE_S,
+        ):
+            auto_matched, no_match, ambiguous = drift_auto, drift_no, drift_amb
+            drift_tolerance = _TIME_DRIFT_TOLERANCE_S
 
         # Rotation pass: if allowing swapped width/height would auto-match
         # additional items, ask the user once per album. Common when Immich
@@ -163,6 +197,7 @@ class Matcher:
         rot_auto, rot_no, rot_amb = classify(
             allow_rotation=True,
             allow_missing_picker_camera=allow_missing_camera,
+            time_drift_tolerance_s=drift_tolerance,
         )
         rotation_gain = len(rot_auto) - len(auto_matched)
         if rotation_gain > 0 and self.prompter.confirm_rotation(rotation_gain):
@@ -233,10 +268,17 @@ def _pixel_match(
     return False
 
 
-def _time_match_strict(picker_dt: datetime, asset_dt: datetime) -> bool:
+def _time_match_strict(
+    picker_dt: datetime,
+    asset_dt: datetime,
+    drift_tolerance_s: int = 0,
+) -> bool:
     """True if asset matches picker under any allowed offset, with either
     exact-second precision OR minute-cut alignment (one side has its
-    seconds zeroed)."""
+    seconds zeroed). With ``drift_tolerance_s`` > 0, also accepts a small
+    absolute second-level drift on top of an allowed offset — used after
+    a per-album confirm for containers where Google and Immich extract
+    slightly different stream timestamps (e.g. AVI)."""
     a = asset_dt.replace(microsecond=0)
     a_min = a.replace(second=0)
     for offset in _AUTO_MATCH_OFFSETS_S:
@@ -244,6 +286,8 @@ def _time_match_strict(picker_dt: datetime, asset_dt: datetime) -> bool:
         if p == a:
             return True
         if (p.second == 0 or a.second == 0) and p.replace(second=0) == a_min:
+            return True
+        if drift_tolerance_s and abs((p - a).total_seconds()) <= drift_tolerance_s:
             return True
     return False
 
@@ -253,6 +297,7 @@ def _strict_match(
     cands: list[ImmichAsset],
     allow_rotation: bool = False,
     allow_missing_picker_camera: bool = False,
+    time_drift_tolerance_s: int = 0,
 ) -> list[ImmichAsset]:
     """Candidates qualifying for auto-match: camera + pixel + strict time.
 
@@ -292,7 +337,9 @@ def _strict_match(
             asset_dt = _parse_iso(a.file_created_at)
         except ValueError:
             continue
-        if _time_match_strict(picker_dt, asset_dt):
+        if _time_match_strict(
+            picker_dt, asset_dt, drift_tolerance_s=time_drift_tolerance_s,
+        ):
             out.append(a)
     return out
 

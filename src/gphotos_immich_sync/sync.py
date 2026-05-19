@@ -226,6 +226,20 @@ class CliPrompter(Prompter):
         ).strip().lower()
         return answer == "y"
 
+    def confirm_time_drift(self, count: int, tolerance_s: int) -> bool:
+        self.progress.clear()
+        print(
+            f"  {count} item(s) would auto-match if up to {tolerance_s}s of "
+            f"timestamp drift is allowed (common with AVI/container files "
+            f"where Google and Immich extract slightly different stream "
+            f"timestamps)."
+        )
+        answer = input(
+            f"  Allow {tolerance_s}s timestamp drift as a strict match "
+            f"for this album? [y/N] "
+        ).strip().lower()
+        return answer == "y"
+
 
 def run() -> None:
     try:
